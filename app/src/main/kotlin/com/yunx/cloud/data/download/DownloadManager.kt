@@ -64,22 +64,28 @@ private const val RANGE_IGNORED_TOLERANCE = 3
 private data class RetryRange(val start: Long, val end: Long, val file: File)
 
 /**
- * 弹性区分配器：按字节顺序领取固定大小块（默认 4MB），保证线程拿到的区间**物理相邻**。
+ * 弹性区分配器：按字节顺序领取固定大小块，保证线程拿到的区间**物理相邻**。
  * 替代"中点劈分"——劈分（先大后小）导致主池耗尽瞬间全部线程涌入弹性区、区间跨度翻倍、
  * 连接复用率崩塌（中后段掉速根因）；按序分配则线程逐个平滑转入弹性区，并发形态不突变。
+ *
+ * ★ 块大小与主池分片大小（chunkSize）保持一致：
+ *   此前弹性区固定 16MB 大块，后 30% 字节只剩约「体积/16MB」个块，线程领完即逐个退出，
+ *   并发从满额逐块塌缩到 1 条连接 →「开头快、后段越来越慢」。
+ *   统一块大小后前/后段并发形态一致、速度曲线平坦，只有最后一小块（几 MB）才自然收尾。
  */
 private class ElasticAllocator(
     private val total: Long,
-    private val elasticStart: Long
+    private val elasticStart: Long,
+    private val blockSize: Long
 ) {
     private val lock = Any()
     private var nextStart = elasticStart
 
-    /** 领取下一个弹性块（按字节顺序，块大小 DEFAULT_ELASTIC_BLOCK；不足 4MB 的尾部整块领取） */
+    /** 领取下一个弹性块（按字节顺序，块大小与主池一致；尾部不足整块时整块领取） */
     fun take(): LongRange? = synchronized(lock) {
         if (nextStart >= total) return null
         val s = nextStart
-        val e = minOf(s + DEFAULT_ELASTIC_BLOCK - 1, total - 1)
+        val e = minOf(s + blockSize - 1, total - 1)
         nextStart = e + 1
         s..e
     }
@@ -87,15 +93,6 @@ private class ElasticAllocator(
     /** 断点续传：跳过已下载前缀（nextStart 只前进） */
     fun skipTo(start: Long) = synchronized(lock) {
         if (start > nextStart) nextStart = start
-    }
-
-    companion object {
-        /** 弹性块大小：16MB。
-         *  弹性区是"空闲线程按序补位"区域，块太小会让单文件掀起的请求数爆炸（GB 级文件几百次），
-         *  每块之间都有建连/排队间隙，正是「开头快、后段慢」的来源之一。
-         *  加大块后每次请求持续更久、连接复用更充分，请求总数下降约 4 倍，后段速度曲线更平坦。
-         *  （CDN 对同区间并发敏感可降 8MB，单连接限速严重可升 32MB） */
-        const val DEFAULT_ELASTIC_BLOCK = 16 * 1024 * 1024L
     }
 }
 
@@ -637,9 +634,10 @@ class DownloadManager(
         val failReason = java.util.concurrent.atomic.AtomicReference<String?>(null)
         val rangeIgnoredCount = AtomicInteger(0)         // RANGE_IGNORED 累计次数（偶发 200 容忍）
 
-        // ★ 弹性区分配器：按字节顺序领取 4MB 块，区间物理相邻（替代中点劈分，根治中后段掉速）。
+        // ★ 弹性区分配器：按字节顺序领取与主池同尺寸的块（区间物理相邻），
+        //   前后段并发形态一致（根治后段速度塌缩/限速感）。
         //   续传：不完整 seg 删除重下；完整 seg 前缀推进 nextStart（弹性区按序分配，完成块天然是字节前缀）。
-        val elasticAllocator = ElasticAllocator(total, elasticStart)
+        val elasticAllocator = ElasticAllocator(total, elasticStart, chunkSize)
         if (elasticStart < total) {
             // 不完整 seg 删除（重下）
             chunkDir.listFiles { f -> f.name.startsWith("seg_") && f.name.endsWith(".part") }?.forEach { f ->

@@ -668,13 +668,15 @@ fun MainScreen() {
             targetState = currentTab,
             transitionSpec = {
                 // 根据 Tab 顺序决定滑动方向：向右切（新Tab在右边）→ 新页从右滑入；向左切反向（原生弹簧，最流畅）
+                // 位移收敛为屏宽 1/8：整页滑动是切换掉帧主因（新旧两页叠加绘制），位移减半后开销明显下降
                 val forward = targetState.ordinal > initialState.ordinal
+                val distance: (Int) -> Int = { it / 8 }
                 if (forward) {
-                    (fadeIn(NativeSpringSoft) + slideInHorizontally(NativeSpringIntOffset) { it / 4 })
-                        .togetherWith(fadeOut(NativeSpringSoft) + slideOutHorizontally(NativeSpringIntOffset) { -it / 4 })
+                    (fadeIn(NativeSpringSoft) + slideInHorizontally(NativeSpringIntOffset) { distance(it) })
+                        .togetherWith(fadeOut(NativeSpringSoft) + slideOutHorizontally(NativeSpringIntOffset) { -distance(it) })
                 } else {
-                    (fadeIn(NativeSpringSoft) + slideInHorizontally(NativeSpringIntOffset) { -it / 4 })
-                        .togetherWith(fadeOut(NativeSpringSoft) + slideOutHorizontally(NativeSpringIntOffset) { it / 4 })
+                    (fadeIn(NativeSpringSoft) + slideInHorizontally(NativeSpringIntOffset) { -distance(it) })
+                        .togetherWith(fadeOut(NativeSpringSoft) + slideOutHorizontally(NativeSpringIntOffset) { distance(it) })
                 }
             },
             label = "mainTab"
