@@ -105,6 +105,10 @@ class ChunkDownloader(private val clientProvider: () -> OkHttpClient) {
      * - 服务器忽略 Range（RANGE_IGNORED）：退避后重发 Range 至多 RANGE_RETRIES 次，仍被忽略则返回
      *   RANGE_IGNORED 交由 DownloadManager 回退单流整文件（**全程不下载整文件**）；
      * - 写入后校验「已写字节 == 预期字节」，不足按失败处理（避免空洞文件 = 损坏）。
+     *
+     * @param rotateConnection true 时本请求携带 `Connection: close`，响应后 okhttp 不再复用该连接，
+     *   下一次请求自动开全新 TCP 连接。用于规避 CDN 按"连接年龄/累计字节"限速（前快后慢根因）：
+     *   老连接被限速到几十 KB/s，轮换后回到"年轻连接满速"——与主池首批建连（历来最快）行为一致。
      */
     suspend fun downloadChunk(
         taskId: Long,
@@ -113,6 +117,10 @@ class ChunkDownloader(private val clientProvider: () -> OkHttpClient) {
         end: Long,
         partFile: File,
         headers: Map<String, String>,
+        rotateConnection: Boolean = false,
+        // ★ 必须是最后一个参数：Kotlin K1 编译器把参数列表后的尾随 lambda 绑定到「最后声明的参数」，
+        //   若 onBytes 不是末位（如上一版把 rotateConnection 放其后），所有调用点的尾随 lambda 都会
+        //   错位绑定到 Boolean 参数 → 编译不过。保持 onBytes 末位与全部现有调用点兼容。
         onBytes: suspend (Long) -> Unit
     ): ChunkResult = withContext(Dispatchers.IO) {
         val attempts = CHUNK_RETRIES + RANGE_RETRIES
@@ -126,7 +134,7 @@ class ChunkDownloader(private val clientProvider: () -> OkHttpClient) {
             if (!unknownTotal && existing >= expected) return@withContext ChunkResult.OK
 
             val res = try {
-                doChunkAttempt(taskId, url, from, end, unknownTotal, partFile, headers, existing, onBytes)
+                doChunkAttempt(taskId, url, from, end, unknownTotal, partFile, headers, existing, rotateConnection, onBytes)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: IOException) {
@@ -161,12 +169,19 @@ class ChunkDownloader(private val clientProvider: () -> OkHttpClient) {
         partFile: File,
         headers: Map<String, String>,
         existing: Long,
+        rotateConnection: Boolean,
+        // ★ 同 downloadChunk：必须保持最后一个参数，避免尾随 lambda 错位绑定
         onBytes: suspend (Long) -> Unit
     ): ChunkResult {
         val request = Request.Builder()
             .url(url)
             .header("Range", if (unknownTotal) "bytes=$from-" else "bytes=$from-$end")
-            .apply { headers.forEach { (k, v) -> header(k, v) } }
+            .apply {
+                headers.forEach { (k, v) -> header(k, v) }
+                // ★ 轮换连接：响应后 okhttp 不回收复用本连接，下一次请求自动开新连接，
+                //   规避 CDN 按连接年龄/累计字节限速（"前快后慢"根因之一）
+                if (rotateConnection) header("Connection", "close")
+            }
             .get().build()
 
         val call = client.newCall(request)

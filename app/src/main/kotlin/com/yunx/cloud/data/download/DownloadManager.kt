@@ -73,9 +73,11 @@ private data class RetryRange(val start: Long, val end: Long, val file: File)
  *   并发从满额逐块塌缩到 1 条连接 →「开头快、后段越来越慢」。
  *   统一块大小后前/后段并发形态一致、速度曲线平坦。
  *
- * ★ 末段细分（fine）：弹性区剩余字节 ≤ 线程数 × 细块大小 时，块大小降为细块（2MB）。
- *   收尾期所有线程仍在满并发抢细块，最后在飞块更小、耗时更短：
- *   速度曲线贴地保持到最后一个字节，而不是在末尾几十 MB 提前"掉速度"。
+ * ★ 末段两级细分（fine/nano）：弹性区剩余字节收窄时逐级降块大小。
+ *   fine：剩余 ≤ 线程数 × 2MB 时切 2MB 细块，收尾期所有线程仍满并发抢块；
+ *   nano：剩余 ≤ 线程数 × 1MB 时再切 512KB 超细块 —— 最后一块即使单连接也 <1MB，
+ *         哪怕连接被限速到 100KB/s 也只是几秒的收尾，杜绝"末尾趴窝/跟下不动"。
+ *   两个新档新增请求数均有界（≤ 3×线程数），不会无效膨胀请求量。
  */
 private class ElasticAllocator(
     private val total: Long,
@@ -89,11 +91,18 @@ private class ElasticAllocator(
     /** 末段细块大小：2MB（收尾期并发粒度，总请求数增量≈并发线程数，可控） */
     private val fineSize = 2 * 1024 * 1024L
 
-    /** 领取下一个弹性块（按字节顺序；剩余不足「并发线程数的细块」时自动切细块） */
+    /** 收尾超细块：512KB（最后单块 <1MB，几秒内收完） */
+    private val nanoSize = 512 * 1024L
+
+    /** 领取下一个弹性块（按字节顺序；剩余收窄时自动逐级切小：blockSize → 2MB → 512KB） */
     fun take(): LongRange? = synchronized(lock) {
         if (nextStart >= total) return null
         val remain = total - nextStart
-        val size = if (remain <= threads * fineSize) fineSize else blockSize
+        val size = when {
+            remain <= threads * nanoSize * 2 -> nanoSize
+            remain <= threads * fineSize -> fineSize
+            else -> blockSize
+        }
         val s = nextStart
         val e = minOf(s + size - 1, total - 1)
         nextStart = e + 1
@@ -728,7 +737,11 @@ class DownloadManager(
                             }
                         }
                     }
-                    // 阶段 2：主池取空 → 弹性区按字节顺序领取 4MB 块（空闲线程逐个平滑转入，并发形态不突变）
+                    // 阶段 2：主池取空 → 弹性区按字节顺序领取与主池同尺寸的块
+                    //   （空闲线程逐个平滑转入，并发形态不突变；末尾自动切 2MB/512KB 细块）
+                    // ★ rotateConnection：弹性区每个块都用全新 TCP 连接（Connection: close），
+                    //   规避 CDN 按「连接累计字节/寿命」限速——老化连接掉到几十 KB/s 的正是后段掉速根因。
+                    //   轮换后每个块都处于"年轻连接满速"状态，与主池首批建连（历来最快）行为一致。
                     while (!fallback.get()) {
                         val range = elasticAllocator.take() ?: break
                         val s = range.first
@@ -739,7 +752,8 @@ class DownloadManager(
                                 if (fallback.get()) return@withPermit ChunkResult.FAILED
                                 downloader.downloadChunk(
                                     taskId = id, url = task.url, start = s, end = e,
-                                    partFile = File(chunkDir, "seg_$key.part"), headers = headers
+                                    partFile = File(chunkDir, "seg_$key.part"), headers = headers,
+                                    rotateConnection = true
                                 ) { bytes ->
                                     speedLimiter.awaitAllow(bytes)
                                     // ★ 钳制到 total：任何竞态都不可能让显示超过总大小
@@ -811,10 +825,12 @@ class DownloadManager(
                             val pos = retryIdx.getAndIncrement()
                             if (pos >= missing.size) break
                             val m = missing[pos]
+                            // 弹性区段（seg_*）重试同样强制轮换连接：避免复用池中老化限速连接而重蹈"末尾趴窝"
+                            val isElastic = m.file.name.startsWith("seg_")
                             val res = try {
                                 downloader.downloadChunk(
                                     taskId = id, url = task.url, start = m.start, end = m.end,
-                                    partFile = m.file, headers = headers
+                                    partFile = m.file, headers = headers, rotateConnection = isElastic
                                 ) { bytes ->
                                     speedLimiter.awaitAllow(bytes)
                                     // ★ 钳制到 total：任何竞态都不可能让显示超过总大小

@@ -63,7 +63,15 @@ object HttpClients {
                     timeUnit = TimeUnit.MINUTES
                 )
             )
-            .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
+            // ★ 分片下载强制 HTTP/1.1（仅下载客户端，API 客户端保持 h2）：
+            //   HTTP/2 会把同一域名所有分片请求多路复用进「单条 TCP 连接」，
+            //   CDN 按连接生命周期/累计字节限速时这根"独苗"连接从文件头一路老化到尾部，
+            //   全体 worker 一起被渐进限速 →「前快后慢、最后下不动」的真正根因。
+            //   强制 h1.1 后每个 worker 独占一条物理连接：
+            //   1) 单连接限速只影响一个 worker，其余线程保持满速（并发形态不再共享塌缩）；
+            //   2) `Connection: close` 轮换连接才能真正断开旧连接、建新连接（h2 下该头无效），
+            //      弹性区每个请求都用"年轻连接"，CDN 的字节/寿命限速永远不会累积。
+            .protocols(listOf(Protocol.HTTP_1_1))
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
             .writeTimeout(30, TimeUnit.SECONDS)
