@@ -64,28 +64,38 @@ private const val RANGE_IGNORED_TOLERANCE = 3
 private data class RetryRange(val start: Long, val end: Long, val file: File)
 
 /**
- * 弹性区分配器：按字节顺序领取固定大小块，保证线程拿到的区间**物理相邻**。
+ * 弹性区分配器：按字节顺序领取块，保证线程拿到的区间**物理相邻**。
  * 替代"中点劈分"——劈分（先大后小）导致主池耗尽瞬间全部线程涌入弹性区、区间跨度翻倍、
  * 连接复用率崩塌（中后段掉速根因）；按序分配则线程逐个平滑转入弹性区，并发形态不突变。
  *
  * ★ 块大小与主池分片大小（chunkSize）保持一致：
  *   此前弹性区固定 16MB 大块，后 30% 字节只剩约「体积/16MB」个块，线程领完即逐个退出，
  *   并发从满额逐块塌缩到 1 条连接 →「开头快、后段越来越慢」。
- *   统一块大小后前/后段并发形态一致、速度曲线平坦，只有最后一小块（几 MB）才自然收尾。
+ *   统一块大小后前/后段并发形态一致、速度曲线平坦。
+ *
+ * ★ 末段细分（fine）：弹性区剩余字节 ≤ 线程数 × 细块大小 时，块大小降为细块（2MB）。
+ *   收尾期所有线程仍在满并发抢细块，最后在飞块更小、耗时更短：
+ *   速度曲线贴地保持到最后一个字节，而不是在末尾几十 MB 提前"掉速度"。
  */
 private class ElasticAllocator(
     private val total: Long,
     private val elasticStart: Long,
-    private val blockSize: Long
+    private val blockSize: Long,
+    private val threads: Int
 ) {
     private val lock = Any()
     private var nextStart = elasticStart
 
-    /** 领取下一个弹性块（按字节顺序，块大小与主池一致；尾部不足整块时整块领取） */
+    /** 末段细块大小：2MB（收尾期并发粒度，总请求数增量≈并发线程数，可控） */
+    private val fineSize = 2 * 1024 * 1024L
+
+    /** 领取下一个弹性块（按字节顺序；剩余不足「并发线程数的细块」时自动切细块） */
     fun take(): LongRange? = synchronized(lock) {
         if (nextStart >= total) return null
+        val remain = total - nextStart
+        val size = if (remain <= threads * fineSize) fineSize else blockSize
         val s = nextStart
-        val e = minOf(s + blockSize - 1, total - 1)
+        val e = minOf(s + size - 1, total - 1)
         nextStart = e + 1
         s..e
     }
@@ -586,7 +596,9 @@ class DownloadManager(
         val mainPoolCount = (chunkCount * 0.7).toInt().coerceIn(1, chunkCount) // 主池片数（70%）
         val elasticStart = mainPoolCount * chunkSize                          // 弹性区起始字节
         val planFile = File(chunkDir, "plan.txt")
-        val plan = "chunks=$chunkCount total=$total main=$mainPoolCount"
+        // ★ 分片计划签名含弹性块大小：算法升级（如弹性块 16MB→chunkSize）或线程/大小变化
+        //   都会清空旧 part 重下，杜绝新旧网格混用以免续传损坏
+        val plan = "chunks=$chunkCount total=$total main=$mainPoolCount block=$chunkSize"
         if (planFile.exists() && planFile.readText() != plan) {
             Log.w(TAG, "runTask: id=$id 分片计划变化（$plan），清空旧 part 重下")
             chunkDir.deleteRecursively()
@@ -635,28 +647,25 @@ class DownloadManager(
         val rangeIgnoredCount = AtomicInteger(0)         // RANGE_IGNORED 累计次数（偶发 200 容忍）
 
         // ★ 弹性区分配器：按字节顺序领取与主池同尺寸的块（区间物理相邻），
-        //   前后段并发形态一致（根治后段速度塌缩/限速感）。
-        //   续传：不完整 seg 删除重下；完整 seg 前缀推进 nextStart（弹性区按序分配，完成块天然是字节前缀）。
-        val elasticAllocator = ElasticAllocator(total, elasticStart, chunkSize)
+        //   前后段并发形态一致（根治后段速度塌缩/限速感）；末尾自动切细块（末段细分见类注释）。
+        val elasticAllocator = ElasticAllocator(total, elasticStart, chunkSize, effectiveWorkers)
         if (elasticStart < total) {
-            // 不完整 seg 删除（重下）
-            chunkDir.listFiles { f -> f.name.startsWith("seg_") && f.name.endsWith(".part") }?.forEach { f ->
-                val name = f.name.removePrefix("seg_").removeSuffix(".part")
-                val s = name.substringBefore('_').toLongOrNull() ?: return@forEach
-                val e = name.substringAfter('_').toLongOrNull() ?: return@forEach
-                if (f.length() < (e - s + 1)) f.delete()
-            }
-            // 推进到已完整前缀末尾（只前进，跳过已下载弹性块）
-            val doneSegs = chunkDir.listFiles { f -> f.name.startsWith("seg_") && f.name.endsWith(".part") }
+            // ★ 弹性区续传重建：只保留「从 elasticStart 起连续完整」的字节前缀。
+            //   1) 不完整的 seg 一律删除（重下）；
+            //   2) 完整但不与当前前缀衔接的 seg 也删除（乱序完成/旧块网格残留的孤儿片段，
+            //      分配器会按序重新覆盖这些区间，若保留会在合并时字节重叠 → 文件损坏）；
+            //   3) 前缀之后推进 nextStart，跳过已下前缀。
+            val segs = chunkDir.listFiles { f -> f.name.startsWith("seg_") && f.name.endsWith(".part") }
                 ?.mapNotNull { f ->
                     val name = f.name.removePrefix("seg_").removeSuffix(".part")
                     val s = name.substringBefore('_').toLongOrNull() ?: return@mapNotNull null
                     val e = name.substringAfter('_').toLongOrNull() ?: return@mapNotNull null
-                    if (f.length() >= (e - s + 1)) s to e else null
-                }?.sortedBy { it.first } ?: emptyList()
+                    Triple(f, s, e)
+                }?.sortedBy { it.second } ?: emptyList()
             var resumeNext = elasticStart
-            for ((s, e) in doneSegs) {
-                if (s == resumeNext) resumeNext = e + 1 else break
+            for ((f, s, e) in segs) {
+                val complete = f.length() >= (e - s + 1)
+                if (complete && s == resumeNext) resumeNext = e + 1 else f.delete()
             }
             elasticAllocator.skipTo(resumeNext)
         }
@@ -666,15 +675,19 @@ class DownloadManager(
         val sem = Semaphore(effectiveWorkers)
 
         val allOk = coroutineScope {
-            val workers = List(effectiveWorkers) {
+            val workers = List(effectiveWorkers) { workerIdx ->
                 async(Dispatchers.IO) {
+                    // ★ 错峰建连：仅首个请求前按 worker 序号微延迟，平摊 t=0 的 TCP/TLS 突发。
+                    //   （此前按「分片序号」延迟且在每片请求前都触发 → 越到后面每次领片都额外空等
+                    //     200ms，等于"越来越慢"的隐性节流；改为仅 worker 启动时延迟一次，全程无此开销）
+                    if (workerIdx > 0) {
+                        delay(min(workerIdx.toLong(), STAGGER_CAP.toLong()) * STAGGER_MS)
+                    }
                     // 阶段 1：主池循环领取
                     while (true) {
                         if (fallback.get()) break
                         val i = nextIdx.getAndIncrement()
                         if (i >= mainPoolCount) break
-                        // 错峰建连：首请求前按序号微延迟，平摊 TCP/TLS 突发（仅影响首请求，不影响稳态并发）
-                        if (i > 0) delay(min(i.toLong(), STAGGER_CAP.toLong()) * STAGGER_MS)
                         sem.withPermit {
                             if (fallback.get()) return@withPermit
                             val start = i * chunkSize
